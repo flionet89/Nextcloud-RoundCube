@@ -25,16 +25,25 @@
 
 namespace OCA\RoundCube\AppInfo;
 
-use OCP\Authentication\LoginCredentials\IStore;
-use OCP\AppFramework\Bootstrap\IBootContext;
-use OCP\AppFramework\Bootstrap\IBootstrap;
 use OCP\AppFramework\Bootstrap\IRegistrationContext;
 use OCA\RoundCube\Controller\SettingsController;
+use OCP\Authentication\LoginCredentials\IStore;
+use OCP\User\Events\BeforeUserLoggedOutEvent;
 use OCA\RoundCube\Controller\PageController;
+use OCP\AppFramework\Bootstrap\IBootContext;
+use OCP\AppFramework\Bootstrap\IBootstrap;
+use OCP\EventDispatcher\IEventDispatcher;
+use OCA\RoundCube\Auth\LogoutListener;
 use Psr\Container\ContainerInterface;
+use Psr\Log\LoggerInterface;
+use OCP\INavigationManager;
 use OCP\AppFramework\App;
+use OCP\IServerContainer;
+use OCP\IURLGenerator;
+use OCP\IUserSession;
 use OCP\IRequest;
-use OCP\Util;
+use OCP\IConfig;
+use OCP\IL10N;
 
 class Application extends App implements IBootstrap
 {
@@ -46,38 +55,35 @@ class Application extends App implements IBootstrap
 
     public function register(IRegistrationContext $context): void {
         $context->registerService(PageController::class, function (ContainerInterface $c) {
-            return new PageController(self::APP_ID, $c->get(IRequest::class), $c->get(IStore::class));
+            return new PageController(self::APP_ID, $c->get(IRequest::class), $c->get(IConfig::class),
+                                      $c->get(IStore::class), $c->get(IURLGenerator::class),
+                                      $c->get(IUserSession::class), $c->get(INavigationManager::class),
+                                      $c->get(LoggerInterface::class));
         }, false);
 
         $context->registerService(SettingsController::class, function(ContainerInterface $c) {
-            return new SettingsController(self::APP_ID, $c->get(IRequest::class));
+            return new SettingsController(self::APP_ID, $c->get(IRequest::class), $c->get(IConfig::class),
+                                          $c->get(IURLGenerator::class), $c->get(IL10N::class));
         }, false);
+
+        $context->registerEventListener(BeforeUserLoggedOutEvent::class, LogoutListener::class);
     }
 
     public function boot(IBootContext $context): void {
-        $this->registerHooksAndEvents();
-        $this->addNavigationManager();
-        \OCP\App::registerAdmin('roundcube', 'adminSettings');
-    }
+        $serverContainer = $context->getServerContainer();
+        $navigationManager = $serverContainer->get(INavigationManager::class);
+        $urlGen = $serverContainer->get(IURLGenerator::class);
+        // FIXME: For some reason this little snowflake doesn't work
+        //$l = $serverContainer->get(IL10N::class);
 
-    /* Register the hooks and events */
-    private function registerHooksAndEvents() {
-        Util::connectHook('OC_User', 'post_login', 'OCA\RoundCube\AuthHelper', 'postLogin');
-        Util::connectHook('OC_User', 'logout', 'OCA\RoundCube\AuthHelper', 'logout');
-        Util::connectHook('OC_User', 'post_setPassword', 'OCA\RoundCube\AuthHelper', 'changePasswordListener');
-    }
-
-    private function addNavigationManager() {
-        \OC::$server->getNavigationManager()->add(function () {
-            $urlGen = \OC::$server->getURLGenerator();
-            return array(
-                'id'    => 'roundcube',
-                'order' => 0,
-                'href'  => $urlGen->linkToRoute('roundcube.page.index'),
-                'icon'  => $urlGen->imagePath('roundcube', 'mail.svg'),
-                'name'  => \OC::$server->getL10N('roundcube')->t('Email')
-            );
-        });
+        $navigationManager->add(
+            array('id'    => self::APP_ID,
+                  'order' => 0,
+                  'href'  => $urlGen->linkToRoute('roundcube.page.index'),
+                  'icon'  => $urlGen->imagePath(self::APP_ID, 'mail.svg'),
+                  'name'  => \OC::$server->getL10N(self::APP_ID)->t('Email')
+                 )
+        );
     }
 }
 

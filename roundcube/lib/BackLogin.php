@@ -20,9 +20,11 @@
  */
 namespace OCA\RoundCube;
 
-use OCP\Util;
-use OCA\RoundCube\AuthHelper;
+use OCA\RoundCube\Auth\AuthHelper;
 use OCA\RoundCube\InternalAddress;
+use Psr\Log\LoggerInterface;
+use OCA\RoundCube\Utils;
+use OCP\IConfig;
 
 /**
  * This class provides the login to RC server using curl.
@@ -43,18 +45,24 @@ class BackLogin
     private $rcSessionID = "";
     private $rcSessionAuth = "";
 
+    /** @var LoggerInterface */
+    private $logger;
+
     /**
      * @param string $email Email address.
      * @param string $password The password.
      * @return array/bool ['sessid', 'sessauth'] on success, false on error.
      */
-    public function __construct($email, $password, $rcServer, $rcInternalAddress) {
+    public function __construct(string $email, string $password, IConfig $config,
+                                InternalAddress $rcIA, LoggerInterface $logger)
+    {
         $this->email           = $email;
         $this->password        = $password;
-        $this->config          = \OC::$server->getConfig();
-        $this->enableSSLVerify = $this->config->getAppValue('roundcube', 'enableSSLVerify', true);
-        $this->rcServer          = $rcServer;
-        $this->rcInternalAddress = $rcInternalAddress;
+        $this->config          = $config;
+        $this->logger          = $logger;
+        $this->enableSSLVerify = $config->getAppValue('roundcube', 'enableSSLVerify', true);
+        $this->rcServer          = $rcIA->getAddress();
+        $this->rcInternalAddress = $rcIA->getServer();
     }
 
     /**
@@ -62,21 +70,23 @@ class BackLogin
      * On success, RoundCube is ready to show up.
      * @return bool True on login, false otherwise.
      */
-    public function login() {
+    public function login(): int {
         // End previous session:
         // Delete cookies sessauth & sessid by expiring them.
         setcookie(AuthHelper::COOKIE_RC_SESSID, "-del-", 1, "/", "", true, true);
         setcookie(AuthHelper::COOKIE_RC_SESSAUTH, "-del-", 1, "/", "", true, true);
+
         // Get login page, extracts sessionID and token.
         $loginPageObj = $this->sendRequest("?_task=login", "GET");
         if ($loginPageObj === false) {
-            Util::writeLog('roundcube', __METHOD__ . ": Could not get login page.", Util::ERROR);
-            return false;
+            Utils::log_error($this->logger, "Could not get login page.");
+            return AuthHelper::ERROR_LOGING;
         }
+
         $cookies = self::parseCookies($loginPageObj['headers']['set-cookie']);
-        if (isset($cookies[AuthHelper::COOKIE_RC_SESSID])) {
+        if (isset($cookies[AuthHelper::COOKIE_RC_SESSID]))
             $this->rcSessionID = $cookies[AuthHelper::COOKIE_RC_SESSID];
-        }
+
         // Get input values from login form and prepare data to send.
         $inputs = self::parseInputs($loginPageObj['html']);
         $data = array(
@@ -88,35 +98,37 @@ class BackLogin
             "_user"     => $this->email,
             "_pass"     => $this->password
         );
+
         // Post login form.
         $loginAnswerObj = $this->sendRequest("?_task=login&_action=login", "POST", $data);
         if ($loginAnswerObj === false) {
-            Util::writeLog('roundcube', __METHOD__ . ": Could not get login response.", Util::ERROR);
-            return false;
+            Utils::log_error($this->logger, "Could not get login response.");
+            return AuthHelper::ERROR_LOGING;
         }
+
         // Set cookies sessauth and sessid.
         $cookiesLogin = self::parseCookies($loginAnswerObj['headers']['set-cookie']);
         if (isset($cookiesLogin[AuthHelper::COOKIE_RC_SESSID]) &&
             $cookiesLogin[AuthHelper::COOKIE_RC_SESSID] !== "-del-") {
             $this->rcSessionID = $cookiesLogin[AuthHelper::COOKIE_RC_SESSID];
-            setcookie(AuthHelper::COOKIE_RC_SESSID, $this->rcSessionID,
-                0, "/", "", true, true);
+            setcookie(AuthHelper::COOKIE_RC_SESSID, $this->rcSessionID, 0, "/", "", true, true);
         }
+
         if (isset($cookiesLogin[AuthHelper::COOKIE_RC_SESSAUTH]) &&
             $cookiesLogin[AuthHelper::COOKIE_RC_SESSAUTH] !== "-del-") {
             // We received a sessauth => logged in!
             $this->rcSessionAuth = $cookiesLogin[AuthHelper::COOKIE_RC_SESSAUTH];
-            setcookie(AuthHelper::COOKIE_RC_SESSAUTH, $this->rcSessionAuth,
-                0, "/", "", true, true);
-            return true;
+            setcookie(AuthHelper::COOKIE_RC_SESSAUTH, $this->rcSessionAuth, 0, "/", "", true, true);
+            return AuthHelper::SUCCESS;
         }
+
         // Check again whether input fields of login form exist.
         $inputsLogin = self::parseInputs($loginAnswerObj['html']);
         if (empty($inputsLogin) || !isset($inputsLogin["_user"]) || !isset($inputsLogin["_pass"])) {
-            return true; // It shouldn't get here ever.
+            return AuthHelper::SUCCESS; // It shouldn't get here ever.
         } else {
-            Util::writeLog('roundcube', __METHOD__ . ": Could not login.", Util::ERROR);
-            return false;
+            Utils::log_error($this->logger, "Could not login.");
+            return AuthHelper::ERROR_LOGING;
         }
     }
 
@@ -132,15 +144,14 @@ class BackLogin
                     $tmp = array();
                     $name = "";
                     foreach ($keyvalMatches[1] as $index => $key) {
-                        if ($key === "name") {
+                        if ($key === "name")
                             $name = $keyvalMatches[2][$index];
-                        } else {
+                        else
                             $tmp[$key] = $keyvalMatches[2][$index];
-                        }
                     }
-                    if ($name !== "") {
+
+                    if ($name !== "")
                         $inputs[$name] = $tmp;
-                    }
                 }
             }
         }
@@ -159,7 +170,8 @@ class BackLogin
     private function sendRequest($rcQuery, $method, $data = null) {
         $response = false;
         $rcQuery = $this->rcServer . "$rcQuery";
-        Util::writeLog('roundcube', __METHOD__ . ": URL: '$rcQuery'.", Util::DEBUG);
+        Utils::log_debug($this->logger, "URL: '$rcQuery'.");
+
         try {
             $curl = curl_init();
             // general settings
@@ -170,6 +182,7 @@ class BackLogin
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_FRESH_CONNECT  => true
             );
+
             if ($method === 'POST') {
                 $curlOpts[CURLOPT_POST] = true;
                 if ($data) {
@@ -188,16 +201,17 @@ class BackLogin
             } else {
                 $curlOpts[CURLOPT_HTTPGET] = true;
             }
+
             $cookies = "";
-            if ($this->rcSessionID !== "") {
+            if ($this->rcSessionID !== "")
                 $cookies .= AuthHelper::COOKIE_RC_SESSID . "={$this->rcSessionID}; ";
-            }
-            if ($this->rcSessionAuth !== "") {
+
+            if ($this->rcSessionAuth !== "")
                 $cookies .= AuthHelper::COOKIE_RC_SESSAUTH . "={$this->rcSessionAuth}; ";
-            }
+
             $curlOpts[CURLOPT_COOKIE] = rtrim($cookies, "; ");
             if (!$this->enableSSLVerify) {
-                Util::writeLog('roundcube', __METHOD__ . ": Disabling SSL verification.", Util::WARN);
+                Utils::log_warning($this->logger, "Disabling SSL verification.");
                 $curlOpts[CURLOPT_SSL_VERIFYPEER] = false;
                 $curlOpts[CURLOPT_SSL_VERIFYHOST] = 0;
             }
@@ -210,16 +224,19 @@ class BackLogin
             $curlError      = curl_error($curl);
             $headerSize     = curl_getinfo($curl, CURLINFO_HEADER_SIZE);
             $respHttpCode   = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-            Util::writeLog('roundcube', __METHOD__ . ": Got the following HTTP Status Code: ($respHttpCode) $curlErrorNum: $curlError", Util::DEBUG);
-            if ($curlErrorNum === CURLE_OK && $respHttpCode < 400) {
+
+            Utils::log_debug($this->logger, "Got the following HTTP Status Code: ($respHttpCode) $curlErrorNum: $curlError");
+
+            if ($curlErrorNum === CURLE_OK && $respHttpCode < 400)
                 $response = self::splitResponse($rawResponse, $headerSize);
-            } else {
-                Util::writeLog('roundcube', __METHOD__ . ": Opening url '$rcQuery' failed with '$curlError'", Util::WARN);
-            }
+            else
+                Utils::log_warning($this->logger, "Opening url '$rcQuery' failed with '$curlError'");
+
             curl_close($curl);
         } catch (Exception $e) {
-            Util::writeLog('roundcube', __METHOD__ . ": URL '$rcQuery' open failed.", Util::WARN);
+            Utils::log_warning($this->logger, "URL '$rcQuery' open failed.");
         }
+
         return $response;
     }
 
@@ -239,11 +256,9 @@ class BackLogin
             $headers = $hh[0];
             $html    = $hh[1];
         }
+
         $headersArray = self::parseResponseHeaders($headers);
-        return array(
-            'headers' => $headersArray,
-            'html'    => $html
-        );
+        return array('headers' => $headersArray, 'html' => $html);
     }
 
     /**
@@ -273,11 +288,11 @@ class BackLogin
             if ($header && is_string($header) && strpos($header, ':') !== false) {
                 list($name, $value) = explode(': ', $header, 2);
                 $name = strtolower($name);
-                if (!isset($responseHeaders[$name])) {
+
+                if (!isset($responseHeaders[$name]))
                     $responseHeaders[$name] = array($value);
-                } else {
+                else
                     $responseHeaders[$name][] = $value;
-                }
             }
         }
         return $responseHeaders;
@@ -289,15 +304,12 @@ class BackLogin
      */
     private static function parseCookies($cookieHeaders) {
         $cookies = array();
-        if (is_array($cookieHeaders)) {
-            foreach ($cookieHeaders as $ch) {
-                if (preg_match('/^([^=]+)=([^;]+);/i', $ch, $match)) {
-                    if ($match[1] !== "" && $match[2] !== "" && strlen($match[2]) > 5) {
+        if (is_array($cookieHeaders))
+            foreach ($cookieHeaders as $ch)
+                if (preg_match('/^([^=]+)=([^;]+);/i', $ch, $match))
+                    if ($match[1] !== "" && $match[2] !== "" && strlen($match[2]) > 5)
                         $cookies[$match[1]] = $match[2];
-                    }
-                }
-            }
-        }
+
         return $cookies;
     }
 }
